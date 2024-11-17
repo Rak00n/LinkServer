@@ -82,6 +82,7 @@ func processClientRequest(req clientRequest, conn net.UDPConn, remoteAddr *net.U
 		body := []byte(`{
 		"packetType": "networkPacket",
 		"payload": "`+req.Payload+`"}`)
+		
 		fmt.Println("Retransmitting packet")
 		fmt.Println(activeNetworks)
 		for _,endpoint := range activeNetworks[req.NetworkID].endpoints {
