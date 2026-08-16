@@ -6,87 +6,65 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
-	"sync/atomic"
+	"syscall"
 	"time"
 )
 
-const MaxWorkers = 1024
-
-var workerSem = make(chan struct{}, MaxWorkers)
+const (
+	serverPort       = 8082
+	heartbeatTimeout = 90 * time.Second
+	maxEndpoints     = 10000
+	cleanupInterval  = 60 * time.Second
+	readBufferSize   = 65535
+)
 
 type endpoint struct {
-	endpointIP                   string
-	endpointUDPConnectionAddress *net.UDPAddr
+	EndpointIP                   string       `json:"-"`
+	EndpointUDPConnectionAddress *net.UDPAddr `json:"-"`
+	LastSeen                     time.Time    `json:"-"`
 }
 
 type activeNetwork struct {
-	networkID         int
-	mu                sync.RWMutex
-	endpointsByIP     map[string]int
-	endpointsByClient map[int]int
-	endpoints         []endpoint
+	NetworkID int                 `json:"-"`
+	Endpoints map[int]endpoint    `json:"-"`
+}
+
+type clientRequest struct {
+	NetworkID  json.Number `json:"networkID"`
+	ClientID   json.Number `json:"clientID"`
+	SrcIp      string      `json:"srcIp"`
+	DstIp      string      `json:"dstIP"`
+	PacketType string      `json:"packetType"`
+	Payload    string      `json:"payload"`
+}
+
+// NetworkID returns the parsed network ID as an int.
+func (r *clientRequest) NetworkIDInt() int {
+	v, _ := r.NetworkID.Int64()
+	return int(v)
+}
+
+// ClientID returns the parsed client ID as an int.
+func (r *clientRequest) ClientIDInt() int {
+	v, _ := r.ClientID.Int64()
+	return int(v)
+}
+
+type controlResponse struct {
+	PacketType string `json:"packetType"`
+	Payload    string `json:"payload"`
 }
 
 var (
-	activeNetworks   = make(map[int]*activeNetwork)
-	activeNetworksMu sync.RWMutex
+	activeNetworks map[int]activeNetwork
+	mu             sync.RWMutex
+	udpServer      *net.UDPConn
 )
-
-func getOrCreateNetwork(networkID int) *activeNetwork {
-	activeNetworksMu.RLock()
-	network, ok := activeNetworks[networkID]
-	activeNetworksMu.RUnlock()
-	if ok {
-		return network
-	}
-	activeNetworksMu.Lock()
-	defer activeNetworksMu.Unlock()
-	network, ok = activeNetworks[networkID]
-	if ok {
-		return network
-	}
-	network = &activeNetwork{
-		networkID:         networkID,
-		endpointsByIP:     make(map[string]int),
-		endpointsByClient: make(map[int]int),
-		endpoints:         make([]endpoint, 0, 16),
-	}
-	activeNetworks[networkID] = network
-	return network
-}
-
-func updateEndpoint(network *activeNetwork, clientID int, ip string, addr *net.UDPAddr) {
-	network.mu.Lock()
-	defer network.mu.Unlock()
-	if existingIdx, ok := network.endpointsByClient[clientID]; ok {
-		oldIP := network.endpoints[existingIdx].endpointIP
-		network.endpoints[existingIdx] = endpoint{
-			endpointIP:                   ip,
-			endpointUDPConnectionAddress: addr,
-		}
-		delete(network.endpointsByIP, oldIP)
-		network.endpointsByIP[ip] = existingIdx
-	} else {
-		idx := len(network.endpoints)
-		network.endpoints = append(network.endpoints, endpoint{
-			endpointIP:                   ip,
-			endpointUDPConnectionAddress: addr,
-		})
-		network.endpointsByClient[clientID] = idx
-		network.endpointsByIP[ip] = idx
-	}
-}
-
-func findEndpointByIP(network *activeNetwork, ip string) (*endpoint, bool) {
-	network.mu.RLock()
-	defer network.mu.RUnlock()
-	if idx, ok := network.endpointsByIP[ip]; ok {
-		return &network.endpoints[idx], true
-	}
-	return nil, false
-}
 
 func int2ip(nn uint32) net.IP {
 	ip := make(net.IP, 4)
@@ -94,133 +72,216 @@ func int2ip(nn uint32) net.IP {
 	return ip
 }
 
-var packetPool = sync.Pool{
-	New: func() interface{} {
-		buf := make([]byte, 65535)
-		return &buf
-	},
+func upsertEndpoint(networkID, clientID int, dstIP string, addr *net.UDPAddr) {
+	mu.Lock()
+	defer mu.Unlock()
+	nw, ok := activeNetworks[networkID]
+	if !ok {
+		activeNetworks[networkID] = activeNetwork{
+			NetworkID: networkID,
+			Endpoints: map[int]endpoint{
+				clientID: {
+					EndpointIP:                   dstIP,
+					EndpointUDPConnectionAddress: addr,
+					LastSeen:                     time.Now(),
+				},
+			},
+		}
+		return
+	}
+	if len(nw.Endpoints) >= maxEndpoints {
+		log.Printf("WARNING: network %d reached max endpoints (%d), evicting oldest", networkID, maxEndpoints)
+		evictOldest(networkID)
+	}
+	nw.Endpoints[clientID] = endpoint{
+		EndpointIP:                   dstIP,
+		EndpointUDPConnectionAddress: addr,
+		LastSeen:                     time.Now(),
+	}
+	activeNetworks[networkID] = nw
 }
 
-var responsePool = sync.Pool{
-	New: func() interface{} {
-		return &bytes.Buffer{}
-	},
+func evictOldest(networkID int) {
+	nw, ok := activeNetworks[networkID]
+	if !ok || len(nw.Endpoints) == 0 {
+		return
+	}
+	var oldestID int
+	var oldestTime time.Time
+	first := true
+	for id, ep := range nw.Endpoints {
+		if first || ep.LastSeen.Before(oldestTime) {
+			oldestID = id
+			oldestTime = ep.LastSeen
+			first = false
+		}
+	}
+	delete(nw.Endpoints, oldestID)
+	activeNetworks[networkID] = nw
 }
 
-type clientRequest struct {
-	Cookie     string `json:"cookie"`
-	NetworkID  int    `json:"networkID"`
-	ClientID   int    `json:"clientID"`
-	SrcIp      string `json:"srcIp"`
-	DstIp      string `json:"dstIP"`
-	PacketType string `json:"packetType"`
-	Payload    string `json:"payload"`
+func cleanupStaleEndpoints() {
+	ticker := time.NewTicker(cleanupInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		mu.Lock()
+		now := time.Now()
+		for netID, nw := range activeNetworks {
+			evicted := false
+			for clientID, ep := range nw.Endpoints {
+				if now.Sub(ep.LastSeen) > heartbeatTimeout {
+					delete(nw.Endpoints, clientID)
+					evicted = true
+				}
+			}
+			if evicted {
+				activeNetworks[netID] = nw
+			}
+			if len(nw.Endpoints) == 0 {
+				delete(activeNetworks, netID)
+			}
+		}
+		mu.Unlock()
+	}
 }
 
-func processClientRequest(req clientRequest, conn *net.UDPConn, remoteAddr *net.UDPAddr) {
-	defer func() {
-		<-workerSem
-	}()
+func forwardPacket(networkID int, dstIP, payload string) error {
+	mu.RLock()
+	nw, ok := activeNetworks[networkID]
+	mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("network %d not found", networkID)
+	}
+	body, err := json.Marshal(controlResponse{
+		PacketType: "networkPacket",
+		Payload:    payload,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal packet: %w", err)
+	}
+	mu.RLock()
+	defer mu.RUnlock()
+	for _, ep := range nw.Endpoints {
+		if ep.EndpointIP == dstIP {
+			_, err := udpServer.WriteToUDP(body, ep.EndpointUDPConnectionAddress)
+			if err != nil {
+				log.Printf("ERROR forwarding to %s: %v", dstIP, err)
+			} else {
+				log.Printf("FORWARDED packet to %s (network %d)", dstIP, networkID)
+			}
+			return nil
+		}
+	}
+	logPrefix := fmt.Sprintf("[network %d] forwarding to %s", networkID, dstIP)
+	log.Printf("%s: registered endpoints: ", logPrefix)
+	for id, ep := range nw.Endpoints {
+		log.Printf("  client %d -> %s (addr: %s)", id, ep.EndpointIP, ep.EndpointUDPConnectionAddress)
+	}
+	return fmt.Errorf("%s: destination not found", logPrefix)
+}
 
-	network := getOrCreateNetwork(req.NetworkID)
-	updateEndpoint(network, req.ClientID, req.SrcIp, remoteAddr)
+func sendControlResponse(addr *net.UDPAddr, resp controlResponse) {
+	body, err := json.Marshal(resp)
+	if err != nil {
+		log.Printf("ERROR marshaling control response: %v", err)
+		return
+	}
+	_, err = udpServer.WriteToUDP(body, addr)
+	if err != nil {
+		log.Printf("ERROR sending control response: %v", err)
+	}
+}
+
+func processClientRequest(req clientRequest, addr *net.UDPAddr) {
+	// Always register/update the endpoint based on the sender's declared IP
+	if req.SrcIp != "" {
+		upsertEndpoint(req.NetworkIDInt(), req.ClientIDInt(), req.SrcIp, addr)
+		log.Printf("Registered client %d (IP=%s) on network %d from %s", req.ClientIDInt(), req.SrcIp, req.NetworkIDInt(), addr)
+	}
 
 	if req.PacketType == "networkPacket" {
-		_, err := base64.StdEncoding.DecodeString(req.Payload)
+		if len(req.Payload) == 0 {
+			log.Printf("WARNING: empty payload from client %d", req.ClientIDInt())
+			return
+		}
+		cleanPayload, err := base64.StdEncoding.DecodeString(req.Payload)
 		if err != nil {
-			return
+			log.Printf("WARNING: base64 decode error from client %d: %v", req.ClientIDInt(), err)
+		} else {
+			log.Printf("Payload: %d bytes from client %d", len(cleanPayload), req.ClientIDInt())
+			if len(cleanPayload) > 0 {
+				log.Printf("First byte: %02x", cleanPayload[0])
+			}
 		}
-
-		dstEndpoint, found := findEndpointByIP(network, req.DstIp)
-		if !found {
-			return
-		}
-
-		respBuf := responsePool.Get().(*bytes.Buffer)
-		respBuf.Reset()
-		respBuf.WriteString(`{"packetType":"networkPacket","payload":"`)
-		respBuf.WriteString(req.Payload)
-		respBuf.WriteString(`"}`)
-		body := respBuf.Bytes()
-
-		_, err = conn.WriteToUDP(body, dstEndpoint.endpointUDPConnectionAddress)
+		err = forwardPacket(req.NetworkIDInt(), req.DstIp, req.Payload)
 		if err != nil {
-			return
+			log.Printf("ERROR forwarding to %s on network %d: %v", req.DstIp, req.NetworkIDInt(), err)
 		}
-		responsePool.Put(respBuf)
-
 	} else if req.PacketType == "controlMessage" {
 		sEnc := base64.StdEncoding.EncodeToString([]byte("ServerHello"))
-		respBuf := responsePool.Get().(*bytes.Buffer)
-		respBuf.Reset()
-		respBuf.WriteString(`{"packetType":"controlMessage","payload":"`)
-		respBuf.WriteString(sEnc)
-		respBuf.WriteString(`"}`)
-		body := respBuf.Bytes()
-
-		_, err := conn.WriteToUDP(body, remoteAddr)
-		if err != nil {
-			return
-		}
-		responsePool.Put(respBuf)
+		sendControlResponse(addr, controlResponse{
+			PacketType: "controlMessage",
+			Payload:    sEnc,
+		})
+		log.Printf("Control response sent to client %d", req.ClientIDInt())
+	} else {
+		log.Printf("WARNING: unknown packet type from client %d", req.ClientIDInt())
 	}
 }
 
 func controlServer() {
-	addr := &net.UDPAddr{
-		Port: 8082,
+	addr := net.UDPAddr{
+		Port: serverPort,
 		IP:   net.ParseIP("0.0.0.0"),
 	}
-
-	ser, err := net.ListenUDP("udp", addr)
+	var err error
+	udpServer, err = net.ListenUDP("udp", &addr)
 	if err != nil {
-		panic(fmt.Sprintf("Failed to listen on UDP :8082: %v", err))
+		log.Fatalf("Failed to start UDP server on port %d: %v", serverPort, err)
 	}
-	defer ser.Close()
-
-	fmt.Println("SDN Control Server listening on :8082")
-
+	defer udpServer.Close()
+	log.Printf("UDP server listening on :%d", serverPort)
+	buf := make([]byte, readBufferSize)
 	for {
-		bufPtr := packetPool.Get().(*[]byte)
-		p := *bufPtr
-
-		n, remoteAddr, err := ser.ReadFromUDP(p)
+		n, remoteAddr, err := udpServer.ReadFromUDP(buf)
 		if err != nil {
-			packetPool.Put(bufPtr)
+			if opErr, ok := err.(*net.OpError); ok {
+				if opErr.Err.Error() == "use of closed network connection" {
+					log.Println("UDP server shut down gracefully")
+					return
+				}
+			}
+			log.Printf("UDP read error: %v", err)
 			continue
 		}
-
-		data := p[:n]
-
+		data := bytes.TrimRight(buf[:n], "\x00")
+		if len(data) == 0 {
+			continue
+		}
 		var req clientRequest
 		if err := json.Unmarshal(data, &req); err != nil {
-			packetPool.Put(bufPtr)
+			log.Printf("WARNING: JSON unmarshal error from %s: %v", remoteAddr, err)
 			continue
 		}
-
-		if req.Cookie != "ItWillBeClientCookie" {
-			packetPool.Put(bufPtr)
-			continue
-		}
-
-		if len(req.Payload) > 0 && req.Payload[0] != 96 {
-			workerSem <- struct{}{}
-			remoteAddrCopy := *remoteAddr
-			go processClientRequest(req, ser, &remoteAddrCopy)
-		}
-
-		packetPool.Put(bufPtr)
+		go processClientRequest(req, remoteAddr)
 	}
 }
 
-var activeNetworksCounter atomic.Uint64
+func gracefulShutdown() {
+	log.Println("Shutting down server...")
+	if udpServer != nil {
+		udpServer.Close()
+	}
+	log.Println("Server shut down complete")
+}
 
 func main() {
-	activeNetworks = make(map[int]*activeNetwork)
+	activeNetworks = make(map[int]activeNetwork)
+	go cleanupStaleEndpoints()
 	go controlServer()
-	fmt.Println("LinkServer SDN started. Press Ctrl+C to stop.")
-	for {
-		time.Sleep(10 * time.Second)
-		_ = activeNetworksCounter.Add(1)
-	}
+	log.Println("LinkServer started successfully")
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+	gracefulShutdown()
 }
