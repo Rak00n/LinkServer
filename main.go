@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"bytes"
@@ -30,8 +30,8 @@ type endpoint struct {
 }
 
 type activeNetwork struct {
-	NetworkID int                 `json:"-"`
-	Endpoints map[int]endpoint    `json:"-"`
+	NetworkID int              `json:"-"`
+	Endpoints map[int]endpoint `json:"-"`
 }
 
 type clientRequest struct {
